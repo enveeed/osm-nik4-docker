@@ -12,14 +12,18 @@ function setPostgresPassword() {
     sudo -u postgres psql -c "ALTER USER renderer PASSWORD '${PGPASSWORD:-renderer}'"
 }
 
-if [ "$#" -ne 1 ]; then
-    echo "usage: <import|run>"
+# Create shared directory if not exists
+mkdir -p /shared/
+
+# Paths: input is /shared/in, output is /shared/out
+
+if [ "$#" -lt 1 ]; then
+    echo "usage: <import|render [nik4 args]>"
     echo "commands:"
-    echo "    import: Set up the database and import /data.osm.pbf"
-    echo "    run: Runs Apache and renderd to serve tiles at /tile/{z}/{x}/{y}.png"
+    echo "    import: Set up the database and import /shared/in"
+    echo "    render: Runs nik4 to render the database contents to an image file."
     echo "environment variables:"
-    echo "    THREADS: defines number of threads used for importing / tile rendering"
-    echo "    UPDATES: consecutive updates (enabled/disabled)"
+    echo "    THREADS: defines number of threads used for importing."
     exit 1
 fi
 
@@ -41,76 +45,29 @@ if [ "$1" = "import" ]; then
     sudo -u postgres psql -d gis -c "ALTER TABLE spatial_ref_sys OWNER TO renderer;"
     setPostgresPassword
 
-    # Download Luxembourg as sample if no data is provided
-    if [ ! -f /data.osm.pbf ] && [ -z "$DOWNLOAD_PBF" ]; then
-        echo "WARNING: No import file at /data.osm.pbf, so importing Luxembourg as example..."
-        DOWNLOAD_PBF="https://download.geofabrik.de/europe/luxembourg-latest.osm.pbf"
-        DOWNLOAD_POLY="https://download.geofabrik.de/europe/luxembourg.poly"
-    fi
-
-    if [ -n "$DOWNLOAD_PBF" ]; then
-        echo "INFO: Download PBF file: $DOWNLOAD_PBF"
-        wget -nv "$DOWNLOAD_PBF" -O /data.osm.pbf
-        if [ -n "$DOWNLOAD_POLY" ]; then
-            echo "INFO: Download PBF-POLY file: $DOWNLOAD_POLY"
-            wget -nv "$DOWNLOAD_POLY" -O /data.poly
-        fi
-    fi
-
-    if [ "$UPDATES" = "enabled" ]; then
-        # determine and set osmosis_replication_timestamp (for consecutive updates)
-        osmium fileinfo /data.osm.pbf > /var/lib/mod_tile/data.osm.pbf.info
-        osmium fileinfo /data.osm.pbf | grep 'osmosis_replication_timestamp=' | cut -b35-44 > /var/lib/mod_tile/replication_timestamp.txt
-        REPLICATION_TIMESTAMP=$(cat /var/lib/mod_tile/replication_timestamp.txt)
-
-        # initial setup of osmosis workspace (for consecutive updates)
-        sudo -u renderer openstreetmap-tiles-update-expire $REPLICATION_TIMESTAMP
-    fi
-
-    # copy polygon file if available
-    if [ -f /data.poly ]; then
-        sudo -u renderer cp /data.poly /var/lib/mod_tile/data.poly
-    fi
-
     # Import data
-    sudo -u renderer osm2pgsql -d gis --create --slim -G --hstore --tag-transform-script /home/renderer/src/openstreetmap-carto/openstreetmap-carto.lua --number-processes ${THREADS:-4} -S /home/renderer/src/openstreetmap-carto/openstreetmap-carto.style /data.osm.pbf ${OSM2PGSQL_EXTRA_ARGS}
+    sudo -u renderer osm2pgsql -r xml -d gis --create --slim -G --hstore --tag-transform-script /home/renderer/src/openstreetmap-carto/openstreetmap-carto.lua --number-processes ${THREADS:-4} -S /home/renderer/src/openstreetmap-carto/openstreetmap-carto.style /shared/in ${OSM2PGSQL_EXTRA_ARGS}
 
     # Create indexes
     sudo -u postgres psql -d gis -f indexes.sql
-
-    # Register that data has changed for mod_tile caching purposes
-    touch /var/lib/mod_tile/planet-import-complete
 
     service postgresql stop
 
     exit 0
 fi
 
-if [ "$1" = "run" ]; then
+if [ "$1" = "render" ]; then
     # Clean /tmp
     rm -rf /tmp/*
 
     # Fix postgres data privileges
     chown postgres:postgres /var/lib/postgresql -R
 
-    # Configure Apache CORS
-    if [ "$ALLOW_CORS" == "enabled" ] || [ "$ALLOW_CORS" == "1" ]; then
-        echo "export APACHE_ARGUMENTS='-D ALLOW_CORS'" >> /etc/apache2/envvars
-    fi
-
-    # Initialize PostgreSQL and Apache
+    # Initialize PostgreSQL
     createPostgresConfig
     service postgresql start
-    service apache2 restart
     setPostgresPassword
 
-    # Configure renderd threads
-    sed -i -E "s/num_threads=[0-9]+/num_threads=${THREADS:-4}/g" /usr/local/etc/renderd.conf
-
-    # start cron job to trigger consecutive updates
-    if [ "$UPDATES" = "enabled" ] || [ "$UPDATES" = "1" ]; then
-      /etc/init.d/cron start
-    fi
 
     # Run while handling docker stop's SIGTERM
     stop_handler() {
@@ -118,10 +75,14 @@ if [ "$1" = "run" ]; then
     }
     trap stop_handler SIGTERM
 
-    sudo -u renderer renderd -f -c /usr/local/etc/renderd.conf &
+    sudo -u postgres nik4 /home/renderer/src/openstreetmap-carto/mapnik.xml /tmp/output.png ${@:2} &
     child=$!
     wait "$child"
 
+    # fallback on user ID 0 (root) if UID for output not provided
+    UID=${UID:0}
+
+    [[ -e /tmp/output.png ]] && cp /tmp/output.png /shared/out && chown $UID:$UID /shared/out
     service postgresql stop
 
     exit 0

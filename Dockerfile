@@ -74,6 +74,7 @@ RUN apt-get install -y --no-install-recommends \
   unzip \
   wget \
   zlib1g-dev \
+  nik4 \
 && apt-get clean autoclean \
 && apt-get autoremove --yes \
 && rm -rf /var/lib/{apt,dpkg,cache,log}/
@@ -107,20 +108,6 @@ RUN mkdir -p /home/renderer/src \
  && chown renderer:renderer /nodes \
  && rm -rf /home/renderer/src/osm2pgsql
 
-# Install mod_tile and renderd
-RUN mkdir -p /home/renderer/src \
- && cd /home/renderer/src \
- && git clone -b switch2osm https://github.com/SomeoneElseOSM/mod_tile.git --depth 1 \
- && cd mod_tile \
- && rm -rf .git \
- && ./autogen.sh \
- && ./configure \
- && make -j $(nproc) \
- && make -j $(nproc) install \
- && make -j $(nproc) install-mod_tile \
- && ldconfig \
- && cd ..
-
 # Configure stylesheet
 RUN mkdir -p /home/renderer/src \
  && cd /home/renderer/src \
@@ -132,24 +119,6 @@ RUN mkdir -p /home/renderer/src \
  && scripts/get-shapefiles.py \
  && rm /home/renderer/src/openstreetmap-carto/data/*.zip
 
-# Configure renderd
-RUN sed -i 's/renderaccount/renderer/g' /usr/local/etc/renderd.conf \
- && sed -i 's/\/truetype//g' /usr/local/etc/renderd.conf \
- && sed -i 's/hot/tile/g' /usr/local/etc/renderd.conf
-
-# Configure Apache
-RUN mkdir /var/lib/mod_tile \
- && chown renderer /var/lib/mod_tile \
- && mkdir /var/run/renderd \
- && chown renderer /var/run/renderd \
- && echo "LoadModule tile_module /usr/lib/apache2/modules/mod_tile.so" >> /etc/apache2/conf-available/mod_tile.conf \
- && echo "LoadModule headers_module /usr/lib/apache2/modules/mod_headers.so" >> /etc/apache2/conf-available/mod_headers.conf \
- && a2enconf mod_tile && a2enconf mod_headers
-COPY apache.conf /etc/apache2/sites-available/000-default.conf
-COPY leaflet-demo.html /var/www/html/index.html
-RUN ln -sf /dev/stdout /var/log/apache2/access.log \
- && ln -sf /dev/stderr /var/log/apache2/error.log
-
 # Configure PosgtreSQL
 COPY postgresql.custom.conf.tmpl /etc/postgresql/12/main/
 RUN chown -R postgres:postgres /var/lib/postgresql \
@@ -157,27 +126,9 @@ RUN chown -R postgres:postgres /var/lib/postgresql \
  && echo "host all all 0.0.0.0/0 md5" >> /etc/postgresql/12/main/pg_hba.conf \
  && echo "host all all ::/0 md5" >> /etc/postgresql/12/main/pg_hba.conf
 
-# Copy update scripts
-COPY openstreetmap-tiles-update-expire /usr/bin/
-RUN chmod +x /usr/bin/openstreetmap-tiles-update-expire \
- && mkdir /var/log/tiles \
- && chmod a+rw /var/log/tiles \
- && ln -s /home/renderer/src/mod_tile/osmosis-db_replag /usr/bin/osmosis-db_replag \
- && echo "*  *    * * *   renderer    openstreetmap-tiles-update-expire\n" >> /etc/crontab
-
-# Install trim_osc.py helper script
-RUN mkdir -p /home/renderer/src \
- && cd /home/renderer/src \
- && git clone https://github.com/zverik/regional \
- && cd regional \
- && git checkout 612fe3e040d8bb70d2ab3b133f3b2cfc6c940520 \
- && rm -rf .git \
- && chmod u+x /home/renderer/src/regional/trim_osc.py
 
 # Start running
 COPY run.sh /
 COPY indexes.sql /
 ENTRYPOINT ["/run.sh"]
 CMD []
-
-EXPOSE 80 5432
